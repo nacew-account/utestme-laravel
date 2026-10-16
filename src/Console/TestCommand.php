@@ -22,18 +22,30 @@ class TestCommand extends Command
         }
         $client->addBreadcrumb('[utestme:test] sending a test error');
         $client->capture(new RuntimeException('uTestMe test error: the Laravel SDK is connected'), [
-            'level' => 'warn',
+            'level' => 'error',
             'handled' => true,
         ]);
-        $status = $client->flush();
-        if ($status !== null && $status >= 200 && $status < 300) {
+        $result = $client->flush();
+        if ($result === null) {
+            $this->error('Nothing was sent. Check UTESTME_KEY and try again.');
+
+            return self::FAILURE;
+        }
+        $status = $result['status'];
+        $events = $result['events'];
+        if ($status >= 200 && $status < 300 && $events !== null && $events >= 1) {
             $this->info('Sent. It shows in uTestMe → Logs in a few seconds.');
 
             return self::SUCCESS;
         }
+        if ($status >= 200 && $status < 300 && ($events === null || $events < 1)) {
+            $this->error('uTestMe answered, but stored no error. Check the app key and try again.');
+
+            return self::FAILURE;
+        }
         $this->error($status === 401
             ? 'uTestMe refused the key. Make a new one on the app\'s page and put it in UTESTME_KEY.'
-            : 'Could not reach uTestMe ('.($status ?? 'no answer').'). Check UTESTME_URL and that the server can make outgoing HTTPS requests.');
+            : 'Could not reach uTestMe ('.$status.'). Check UTESTME_URL and that the server can make outgoing HTTPS requests.');
 
         return self::FAILURE;
     }

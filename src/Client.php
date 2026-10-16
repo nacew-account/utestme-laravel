@@ -21,12 +21,13 @@ use Throwable;
  */
 class Client
 {
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.1.1';
 
     private const MAX_BREADCRUMBS = 10;
     private const BREADCRUMB_CHARS = 300;
     private const MAX_QUEUE = 50;
     private const STATUS_EVERY = 3600;
+    private const MAX_MESSAGE_CHARS = 8000;
 
     /** @var array<int, array{at: int, sdk: array<string, mixed>}> */
     private array $queue = [];
@@ -87,45 +88,90 @@ class Client
         }
     }
 
+    /**
+     * Map a Monolog / Laravel log level to what uTestMe stores, or null when
+     * the line is not an error or warning (info, debug, notice stay breadcrumbs).
+     */
+    public function mapLogLevel(string $level): ?string
+    {
+        return match (strtolower($level)) {
+            'emergency', 'alert', 'critical' => 'fatal',
+            'error' => 'error',
+            'warning', 'warn' => 'warn',
+            default => null,
+        };
+    }
+
     public function capture(Throwable $e, array $context = []): void
     {
         if (! $this->enabled()) {
             return;
         }
-        $request = null;
-        if ($this->request !== null) {
-            $request = [
-                'method' => $this->request['method'],
-                'path' => $this->request['path'],
-                'status' => $context['status'] ?? 500,
-                'durationMs' => (int) round((microtime(true) - $this->request['start']) * 1000),
-            ];
+        $this->enqueue([
+            'level' => $context['level'] ?? 'error',
+            'type' => get_class($e),
+            'message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+            'stack' => $e->getTraceAsString(),
+            'handled' => $context['handled'] ?? false,
+            'status' => $context['status'] ?? 500,
+            'tags' => $context['tags'] ?? null,
+        ]);
+    }
+
+    /**
+     * A Log::error / Log::warning (or emergency/alert/critical) line, without
+     * a Throwable. Skipped when the line is Laravel logging an exception that
+     * reportable already sent.
+     */
+    public function captureMessage(string $message, string $level, array $context = []): void
+    {
+        if (! $this->enabled()) {
+            return;
         }
-        $this->queue[] = [
-            'at' => $this->nowMs(),
-            'sdk' => array_filter([
-                'runtime' => 'php',
-                'level' => $context['level'] ?? 'error',
-                'type' => get_class($e),
-                'message' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
-                'stack' => $e->getTraceAsString(),
-                'at' => $this->nowMs(),
-                'app' => (string) ($this->config['app'] ?? 'laravel'),
-                'request' => $request,
-                'route' => $this->request['route'] ?? null,
-                'release' => $this->config['release'] ?? null,
-                'environment' => $this->config['environment'] ?? null,
-                'user' => $this->user,
-                'handled' => $context['handled'] ?? false,
-                'breadcrumbs' => $this->breadcrumbs,
-                'tags' => $context['tags'] ?? null,
-            ], fn ($v) => $v !== null),
+        $message = trim($message);
+        if ($message === '') {
+            return;
+        }
+        $this->enqueue([
+            'level' => $level,
+            'type' => 'Log',
+            'message' => mb_substr($message, 0, self::MAX_MESSAGE_CHARS),
+            'handled' => $context['handled'] ?? true,
+            'tags' => $context['tags'] ?? null,
+        ]);
+    }
+
+    /**
+     * Send what this request collected. Called after the response is sent.
+     *
+     * @return array{status: int, events: int|null}|null null when nothing to send
+     */
+    public function flush(): ?array
+    {
+        if (! $this->enabled() || (! $this->queue && ! $this->minutes)) {
+            return null;
+        }
+        $eventCount = count($this->queue);
+        $batch = [
+            'v' => 1,
+            'batch' => bin2hex(random_bytes(12)),
+            'agent' => [
+                'version' => 'sdk-laravel/'.self::VERSION,
+                'mode' => null,
+                'hostname' => (string) gethostname(),
+                'os' => php_uname('s').' '.php_uname('r'),
+                'tz' => date_default_timezone_get(),
+                'status' => $this->status(),
+            ],
+            'entries' => $this->queue,
+            'minutes' => $this->minutes,
         ];
-        if (count($this->queue) > self::MAX_QUEUE) {
-            $this->queue = array_slice($this->queue, -self::MAX_QUEUE);
-        }
+        $this->queue = [];
+        $this->minutes = [];
+
+        return $this->post($batch, $eventCount);
     }
 
     /** Count one response; kept in the cache until its minute is over. */
@@ -162,30 +208,60 @@ class Client
         }
     }
 
-    /** Send what this request collected. Called after the response is sent. */
-    public function flush(): ?int
+    /**
+     * @param  array{
+     *   level: string,
+     *   type: string,
+     *   message: string,
+     *   file?: string,
+     *   line?: int,
+     *   stack?: string,
+     *   handled: bool,
+     *   status?: int,
+     *   tags: mixed
+     * }  $fields
+     */
+    private function enqueue(array $fields): void
     {
-        if (! $this->enabled() || (! $this->queue && ! $this->minutes)) {
-            return null;
+        $request = null;
+        if ($this->request !== null) {
+            $request = [
+                'method' => $this->request['method'],
+                'path' => $this->request['path'],
+                'durationMs' => (int) round((microtime(true) - $this->request['start']) * 1000),
+            ];
+            // Exceptions default to 500; Log::error during a normal page has no status yet.
+            if (array_key_exists('status', $fields) && $fields['status'] !== null) {
+                $request['status'] = $fields['status'];
+            } elseif (isset($fields['stack'])) {
+                $request['status'] = 500;
+            }
         }
-        $batch = [
-            'v' => 1,
-            'batch' => bin2hex(random_bytes(12)),
-            'agent' => [
-                'version' => 'sdk-laravel/'.self::VERSION,
-                'mode' => null,
-                'hostname' => (string) gethostname(),
-                'os' => php_uname('s').' '.php_uname('r'),
-                'tz' => date_default_timezone_get(),
-                'status' => $this->status(),
-            ],
-            'entries' => $this->queue,
-            'minutes' => $this->minutes,
+        $this->queue[] = [
+            'at' => $this->nowMs(),
+            'sdk' => array_filter([
+                'runtime' => 'php',
+                'level' => $fields['level'],
+                'type' => $fields['type'],
+                'message' => $fields['message'],
+                'file' => $fields['file'] ?? null,
+                'line' => $fields['line'] ?? null,
+                'stack' => $fields['stack'] ?? null,
+                'at' => $this->nowMs(),
+                'app' => (string) ($this->config['app'] ?? 'laravel'),
+                'request' => $request,
+                'route' => $this->request['route'] ?? null,
+                'release' => $this->config['release'] ?? null,
+                'environment' => $this->config['environment'] ?? null,
+                'user' => $this->user,
+                'handled' => $fields['handled'],
+                'breadcrumbs' => $this->breadcrumbs,
+                'tags' => $fields['tags'],
+            ], fn ($v) => $v !== null),
         ];
-        $this->queue = [];
-        $this->minutes = [];
-
-        return $this->post($batch);
+        if (count($this->queue) > self::MAX_QUEUE) {
+            $this->queue = array_slice($this->queue, -self::MAX_QUEUE);
+        }
     }
 
     /** What the app runs, at most hourly: PHP and Laravel versions. */
@@ -216,8 +292,12 @@ class Client
         ];
     }
 
-    /** POST the batch; the HTTP status, or null when it could not be sent. */
-    private function post(array $batch): ?int
+    /**
+     * POST the batch; status and how many events uTestMe said it took.
+     *
+     * @return array{status: int, events: int|null}|null
+     */
+    private function post(array $batch, int $sentEvents): ?array
     {
         $url = rtrim((string) ($this->config['url'] ?? 'https://utest.me'), '/').'/api/logs/agent/ingest';
         $body = json_encode($batch, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
@@ -241,10 +321,13 @@ class Client
                     CURLOPT_TIMEOUT => $timeout,
                     CURLOPT_CONNECTTIMEOUT => $timeout,
                 ]);
-                curl_exec($ch);
+                $response = curl_exec($ch);
                 $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+                if (! $status) {
+                    return null;
+                }
 
-                return $status ?: null;
+                return ['status' => $status, 'events' => $this->eventsFromResponse($response, $sentEvents)];
             }
             $context = stream_context_create(['http' => [
                 'method' => 'POST',
@@ -253,13 +336,31 @@ class Client
                 'timeout' => $timeout,
                 'ignore_errors' => true,
             ]]);
-            @file_get_contents($url, false, $context);
+            $response = @file_get_contents($url, false, $context);
             $line = $http_response_header[0] ?? '';
+            if (! preg_match('/\s(\d{3})\s/', $line, $m)) {
+                return null;
+            }
 
-            return preg_match('/\s(\d{3})\s/', $line, $m) ? (int) $m[1] : null;
+            return ['status' => (int) $m[1], 'events' => $this->eventsFromResponse($response, $sentEvents)];
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** How many events the ingest reported, or what we sent when the body is opaque. */
+    private function eventsFromResponse(mixed $response, int $sentEvents): ?int
+    {
+        if (! is_string($response) || $response === '') {
+            return null;
+        }
+        $decoded = json_decode($response, true);
+        if (! is_array($decoded) || ! array_key_exists('events', $decoded)) {
+            // 2xx with no JSON body: assume what we sent arrived (older endpoints).
+            return $sentEvents;
+        }
+
+        return is_numeric($decoded['events']) ? (int) $decoded['events'] : null;
     }
 
     private function nowMs(): int

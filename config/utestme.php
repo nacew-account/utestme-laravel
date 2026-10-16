@@ -24,6 +24,11 @@ return [
     // error's context.
     'breadcrumbs' => env('UTESTME_BREADCRUMBS', true),
 
+    // Also send Log::error / Log::warning (and emergency/alert/critical), not
+    // only thrown exceptions. Lines that are Laravel logging a reported
+    // exception are skipped so they are not sent twice.
+    'capture_logs' => env('UTESTME_CAPTURE_LOGS', true),
+
     // Seconds to wait for uTestMe. The send happens after the response has
     // gone to the visitor, so this never slows a page down.
     'timeout' => 3,

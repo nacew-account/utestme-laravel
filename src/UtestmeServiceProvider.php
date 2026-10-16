@@ -18,7 +18,8 @@ use Throwable;
  * setting UTESTME_KEY is all it takes.
  *
  * It adds itself to Laravel's exception reporting (so what Laravel would not
- * report — a 404, a validation error — is not sent either), counts requests
+ * report — a 404, a validation error — is not sent either), sends Log::error
+ * and Log::warning lines (what usually fills laravel.log), counts requests
  * with a global middleware, and keeps the last log lines and SQL statements
  * as context. Nothing it does can change a response or stop the app's own
  * reporting.
@@ -78,10 +79,36 @@ class UtestmeServiceProvider extends ServiceProvider
             $client->setRoute($event->route->uri());
         });
 
-        if ($this->app['config']->get('utestme.breadcrumbs', true)) {
-            Event::listen(MessageLogged::class, function (MessageLogged $log) use ($client) {
-                $client->addBreadcrumb("[log.{$log->level}] {$log->message}");
+        $captureLogs = filter_var(
+            $this->app['config']->get('utestme.capture_logs', true),
+            FILTER_VALIDATE_BOOLEAN,
+        );
+        $breadcrumbs = filter_var(
+            $this->app['config']->get('utestme.breadcrumbs', true),
+            FILTER_VALIDATE_BOOLEAN,
+        );
+
+        if ($captureLogs || $breadcrumbs) {
+            Event::listen(MessageLogged::class, function (MessageLogged $log) use ($client, $captureLogs, $breadcrumbs) {
+                // Laravel's Handler logs the same exception reportable already
+                // sent: skip it so one failure is not two events.
+                if (isset($log->context['exception']) && $log->context['exception'] instanceof Throwable) {
+                    return;
+                }
+
+                $mapped = $client->mapLogLevel($log->level);
+                if ($captureLogs && $mapped !== null) {
+                    $client->captureMessage((string) $log->message, $mapped);
+                }
+
+                // After capture so this line is context for later errors, not itself.
+                if ($breadcrumbs) {
+                    $client->addBreadcrumb("[log.{$log->level}] {$log->message}");
+                }
             });
+        }
+
+        if ($breadcrumbs) {
             Event::listen(QueryExecuted::class, function (QueryExecuted $query) use ($client) {
                 // The statement only: its values (bindings) never leave the app.
                 $client->addBreadcrumb("[sql {$query->time}ms] {$query->sql}");
